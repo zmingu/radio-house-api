@@ -34,6 +34,7 @@ MESSAGE_TRIM_TARGET = 30
 PROMPT_TOKEN_CAP = 30000
 MAX_STREAM_EVENTS = 4000
 REPEAT_STREAK_LIMIT = 12
+SITE_OUTAGE_RETRY_DELAY = 8.0
 class _StreamError(RuntimeError):
     pass
 class _RouteRejected(RuntimeError):
@@ -536,6 +537,7 @@ class RHRouter:
             routing_pass += 1
             saw_transient = False
             saw_hard = False
+            saw_site_outage = False
             for route in self.registry.ordered_routes(card, prefer_tools=bool(tools)):
                 emitted = False
                 for _attempt in range(MAX_CRED_ATTEMPTS):
@@ -620,7 +622,7 @@ class RHRouter:
                         return
                     except _RouteRejected as exc:
                         last_error = exc
-                        hard = _is_tool_error(str(exc))
+                        hard = _is_tool_error(str(exc)) or _is_site_credit_outage(str(exc))
                         saw_hard = saw_hard or hard
                         saw_transient = saw_transient or not hard
                         self.registry.report_route(route.mid, ok=False, hard=hard)
@@ -630,6 +632,14 @@ class RHRouter:
                         depleted = code in (401, 403)
                         rate_limited = code == 429
                         saw_transient = True
+                        if code in (500, 502, 503, 504):
+                            saw_site_outage = saw_site_outage or _is_site_outage(str(exc))
+                            self.registry.report_route(route.mid, ok=False, hard=False)
+                            self.pool.report_result(state, ok=False, depleted=depleted, error=f"http {code}", neutral=True)
+                            last_error = exc
+                            if emitted:
+                                raise
+                            break
                         self.pool.report_result(state, ok=False, depleted=depleted, error=f"http {code}", neutral=not (depleted or rate_limited))
                         last_error = exc
                         if emitted:
@@ -652,9 +662,10 @@ class RHRouter:
                             raise
                         _sleep_jitter(_attempt)
                         continue
-            if routing_pass >= 2 or saw_hard or not saw_transient:
+            max_passes = 2
+            if routing_pass >= max_passes or saw_hard or not saw_transient:
                 break
-            time.sleep(5.0)
+            time.sleep(SITE_OUTAGE_RETRY_DELAY if saw_site_outage else 5.0)
         raise RuntimeError(f"All routes for '{card.id}' failed. Last error: {last_error}")
     def collect(self, messages: List[Dict[str, Any]], model: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
         text_parts: List[str] = []
@@ -726,6 +737,24 @@ def _looks_route_scoped(message: str) -> bool:
         "billing", "entitlement",
         "finish_reason=error",
         "not supported", "input too long", "context length",
+        "no available channel", "run out of api credit", "out of credit",
+        "try again later", "didn't respond", "did not respond",
+        "overloaded", "temporarily unavailable",
+    )
+    return any(m in low for m in markers)
+def _is_site_credit_outage(message: str) -> bool:
+    low = message.lower()
+    markers = (
+        "run out of api credit", "out of credit", "insufficient credit",
+        "quota exceeded", "quota exhausted",
+    )
+    return any(m in low for m in markers)
+def _is_site_outage(message: str) -> bool:
+    low = message.lower()
+    markers = (
+        "no available channel", "run out of api credit", "out of credit",
+        "try again later", "overloaded", "temporarily unavailable",
+        "upstream 502", "upstream 503", "upstream 504",
     )
     return any(m in low for m in markers)
 def _is_tool_error(message: str) -> bool:

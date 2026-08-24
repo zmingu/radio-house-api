@@ -19,6 +19,14 @@ from rh_router import (
     NoCredentialsError,
     RHRouter,
 )
+OUTAGE_MARKERS = (
+    "no available channel", "run out of api credit", "out of credit",
+    "try again later", "overloaded", "temporarily unavailable",
+    "upstream 500", "upstream 502", "upstream 503", "upstream 504",
+)
+def _is_outage(message: str) -> bool:
+    low = message.lower()
+    return any(m in low for m in OUTAGE_MARKERS)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -348,6 +356,8 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                     return _error_body(str(exc), "no_credentials", 503)
                 if isinstance(exc, AllCredentialsBusyError):
                     return _error_body(str(exc), "all_credentials_busy", 429)
+                if _is_outage(str(exc)):
+                    return _error_body(f"Upstream is temporarily unavailable: {exc}", "upstream_unavailable", 503)
                 return _error_body(str(exc), "upstream_error", 502)
         cid = f"chatcmpl-{uuid.uuid4().hex}"
         created = _now()
@@ -371,6 +381,8 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     except AllCredentialsBusyError as exc:
         return _error_body(str(exc), "all_credentials_busy", 429)
     except Exception as exc:
+        if _is_outage(str(exc)):
+            return _error_body(f"Upstream is temporarily unavailable: {exc}", "upstream_unavailable", 503)
         return _error_body(str(exc), "upstream_error", 502)
     prompt_text = "".join(_flatten_content(m.content) for m in body.messages)
     completion_text = result["text"]
