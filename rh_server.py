@@ -21,8 +21,11 @@ from rh_router import (
 )
 OUTAGE_MARKERS = (
     "no available channel", "run out of api credit", "out of credit",
+    "insufficient credit", "insufficient balance", "quota exceeded",
     "try again later", "overloaded", "temporarily unavailable",
     "upstream 500", "upstream 502", "upstream 503", "upstream 504",
+    "didn't respond", "did not respond", "that model didn't respond",
+    "run out of api credit for the moment",
 )
 def _is_outage(message: str) -> bool:
     low = message.lower()
@@ -87,6 +90,12 @@ def _flatten_content(content: Union[str, List[Dict[str, Any]], None]) -> str:
         elif isinstance(part, str):
             parts.append(part)
     return "".join(parts)
+def _truncate_log_content(content: Union[str, List[Dict[str, Any]], None], limit: int = 500) -> str:
+    text = _flatten_content(content) or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
 def _messages_to_dicts(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for msg in messages:
@@ -195,7 +204,7 @@ def _pump_events(router: RHRouter, messages: List[Dict[str, Any]], card: ModelCa
         try:
             for item in gen:
                 events.put(("ev", item))
-        except BaseException as exc:
+        except Exception as exc:
             events.put(("exc", exc))
         finally:
             events.put(sentinel)
@@ -325,7 +334,7 @@ async def _sse_from_events(events: Any, sentinel: object, first: Any, cid: str, 
 async def chat_completions(request: Request, body: ChatCompletionRequest):
     dump = body.model_dump(exclude_unset=True)
     dump["messages"] = [
-        {**m, "content": (_flatten_content(m.get("content")) or "")[:500] + ("..." if len(_flatten_content(m.get("content"))) > 500 else "")}
+        {**m, "content": _truncate_log_content(m.get("content"))}
         for m in (dump.get("messages") or [])
     ]
     try:
