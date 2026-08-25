@@ -26,18 +26,13 @@ The current model list is not finalised for the final release. Expect models to 
 | `gemma-4-26b-a4b-it` | 262k |
 | `gemma-4-31b-it` | 131k |
 | `glm-5.2` | 1M |
-| `glm-5.3` | 1M |
 | `gpt-oss-120b` | 131k |
-| `inkling` | 1M |
 | `inkling-small` | 524k |
 | `kimi-k3` | 1M |
 | `minimax-m3` | 1M |
-| `mistral-small-2603` | 262k |
 | `muse-glimmer-30b` | 131k |
 | `nemotron-3.5-lightning` | 1M |
-| `qwen3.6-27b` | 262k |
 | `qwen3.8-27b` | 262k |
-| `qwen3.8-2.4t-a95b` | 1M |
 
 ## Endpoints
 
