@@ -90,12 +90,6 @@ def _flatten_content(content: Union[str, List[Dict[str, Any]], None]) -> str:
         elif isinstance(part, str):
             parts.append(part)
     return "".join(parts)
-def _truncate_log_content(content: Union[str, List[Dict[str, Any]], None], limit: int = 500) -> str:
-    text = _flatten_content(content) or ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
-
 def _messages_to_dicts(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for msg in messages:
@@ -332,16 +326,6 @@ async def _sse_from_events(events: Any, sentinel: object, first: Any, cid: str, 
 @app.post("/chat/completions")
 @app.post("/api/v1/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
-    dump = body.model_dump(exclude_unset=True)
-    dump["messages"] = [
-        {**m, "content": _truncate_log_content(m.get("content"))}
-        for m in (dump.get("messages") or [])
-    ]
-    try:
-        req_line = json.dumps(dump, ensure_ascii=False, default=str)[:8000]
-    except Exception:
-        req_line = str(dump)[:8000]
-    print(f"[radio-house] {req_line}", flush=True)
     router = get_router(request)
     card = REGISTRY.resolve(body.model)
     if card is None:

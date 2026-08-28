@@ -23,16 +23,17 @@ The current model list is not finalised for the final release. Expect models to 
 | --- | --- |
 | `deepseek-v4-flash-0731` | 1M |
 | `deepseek-v4-pro-0813` | 1M |
-| `gemma-4-26b-a4b-it` | 262k |
-| `gemma-4-31b-it` | 131k |
+| `gemma-4-26b-a4b-it` | 256k |
+| `gemma-4-31b-it` | 256k |
 | `glm-5.2` | 1M |
-| `gpt-oss-120b` | 131k |
+| `glm-5.3-flash` | 1M |
+| `gpt-oss-120b` | 128k |
 | `inkling-small` | 524k |
-| `kimi-k3` | 1M |
 | `minimax-m3` | 1M |
 | `muse-glimmer-30b` | 131k |
-| `nemotron-3.5-lightning` | 1M |
+| `nemotron-3.5-lightning` | 262k |
 | `qwen3.8-27b` | 262k |
+| `qwen3.8-flash` | 1M |
 
 ## Endpoints
 

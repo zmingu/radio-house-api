@@ -20,10 +20,21 @@ _CONTEXT_RE = re.compile(r"\bcontext:\"([^\"]+)\"")
 _PRICE_RE = re.compile(r"\bpricePerMTok:([0-9.]+)")
 def _slugify(pid: str) -> str:
     s = pid.strip().lower()
-    s = re.sub(r"[@+_/.]", "-", s)
-    s = re.sub(r"[^a-z0-9\-]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-.")
+    s = re.sub(r"[@+_/]", "-", s)
+    s = re.sub(r"[^a-z0-9\-.]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = re.sub(r"\.{2,}", ".", s)
+    s = s.strip("-.")
     return s or "model"
+def _standardize_model_id(model_id: str) -> str:
+    s = model_id.strip().lower()
+    s = re.sub(r"^(qwen)(\d+)-(\d+)(?=-|$)", r"\1\2.\3", s)
+    s = re.sub(r"^(glm)-(\d+)-(\d+)(?=-|$|\.)", r"\1-\2.\3", s)
+    s = re.sub(r"^(nemotron)-(\d+)-(\d+)(?=-|$)", r"\1-\2.\3", s)
+    s = re.sub(r"-(\d+)-(\d+)(t)(?=-|$)", r"-\1.\2\3", s)
+    if re.search(r"-(\d)-(\d)(?=-[a-z])", s):
+        s = re.sub(r"-(\d)-(\d)(?=-[a-z])", r"-\1.\2", s, count=1)
+    return s
 def _parse_context(label: str) -> int:
     m = re.match(r"([0-9.]+)\s*([kKmM]?)", label.strip())
     if not m:
@@ -134,7 +145,25 @@ def _build_cards(rows: List[Dict[str, Any]]) -> Tuple[List[ModelCard], Dict[str,
         used_ids[base] = n
         card_id = base if n == 1 else f"{base}-{n}"
         name = row["name"]
-        aliases = tuple(dict.fromkeys(a for a in (raw_id, suffix, name, _slugify(name)) if a))
+        base_aliases = tuple(dict.fromkeys(a for a in (raw_id, suffix, name, _slugify(name)) if a))
+        variant_aliases: List[str] = []
+        for a in base_aliases:
+            low = a.lower()
+            if "." in low:
+                hv = low.replace(".", "-")
+                if hv != low and hv not in variant_aliases:
+                    variant_aliases.append(hv)
+            std = _standardize_model_id(low)
+            if std != low and std not in variant_aliases:
+                variant_aliases.append(std)
+            std_hv = std.replace(".", "-") if "." in std else std
+            if std_hv != low and std_hv != std and std_hv not in variant_aliases:
+                variant_aliases.append(std_hv)
+        if "." in card_id:
+            hv = card_id.replace(".", "-")
+            if hv not in variant_aliases and hv.lower() != card_id.lower():
+                variant_aliases.append(hv)
+        aliases = tuple(dict.fromkeys(list(base_aliases) + variant_aliases))
         route = Route(
             provider=PROVIDER,
             raw_id=raw_id,
@@ -157,6 +186,15 @@ def _build_cards(rows: List[Dict[str, Any]]) -> Tuple[List[ModelCard], Dict[str,
         by_key[card_id.lower()] = card
         for a in aliases:
             by_key[a.lower()] = card
+        std_card = _standardize_model_id(card_id)
+        if std_card.lower() != card_id.lower():
+            by_key[std_card.lower()] = card
+        hv_card = card_id.replace(".", "-")
+        if hv_card.lower() != card_id.lower():
+            by_key[hv_card.lower()] = card
+        by_key[_slugify(card_id).lower()] = card
+        if hv_card != card_id:
+            by_key[_slugify(hv_card).lower()] = card
     return cards, by_key
 class ModelRegistry:
     def __init__(self) -> None:
@@ -221,20 +259,39 @@ class ModelRegistry:
         if key in {"", "auto", "default", "router/default"}:
             return None if strict else self.default()
         self._ensure()
-        with self._lock:
-            card = self._by_key.get(key)
-        if card:
-            return card
+        std = _standardize_model_id(key)
+        hv = key.replace(".", "-") if "." in key else std.replace(".", "-") if "." in std else None
         norm = _slugify(key)
+        std_norm = _standardize_model_id(norm)
+        slug_std = _slugify(std) if std != key else None
+        candidates: List[str] = []
+        for cand in (key, std, hv, norm, std_norm, slug_std):
+            if cand and cand not in candidates:
+                candidates.append(cand)
+                if "." in cand:
+                    hv_c = cand.replace(".", "-")
+                    if hv_c not in candidates:
+                        candidates.append(hv_c)
+                else:
+                    dot_c = _standardize_model_id(cand)
+                    if dot_c != cand and dot_c not in candidates:
+                        candidates.append(dot_c)
         with self._lock:
+            for cand in candidates:
+                card = self._by_key.get(cand)
+                if card:
+                    return card
             for card in self._cards:
-                if card.id == norm:
-                    return card
-                if _slugify(card.label) == norm:
-                    return card
-                for a in card.aliases:
-                    if _slugify(a) == norm:
+                for cand in candidates:
+                    if card.id == cand:
                         return card
+                    if _slugify(card.label) == cand:
+                        return card
+                    for a in card.aliases:
+                        if _slugify(a) == cand or a.lower() == cand:
+                            return card
+                        if _standardize_model_id(a.lower()) == cand:
+                            return card
         return None
     def route_health(self, mid: str) -> RouteHealth:
         with self._lock:
