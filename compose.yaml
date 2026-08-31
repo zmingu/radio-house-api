@@ -1,0 +1,43 @@
+name: ${COMPOSE_PROJECT_NAME:-radio-house-api}
+
+services:
+  radio-house-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: radio-house-api:local
+    container_name: radio-house-api
+    restart: unless-stopped
+    ports:
+      # 该 API 自身没有鉴权。想只给本机用就改成 "127.0.0.1:${HOST_PORT:-8002}:8002"。
+      - "${HOST_PORT:-8002}:8002"
+    volumes:
+      # 容器内 /app/credentials.json 就是 CredentialPool 的默认路径。
+      # 必须可写：凭据耗尽时 _save() 会回写这个文件，挂 :ro 会报错。
+      - ./credentials.json:/app/credentials.json
+      # 出口代理配置。只读即可，进程不写它。
+      # 注意：宿主机上这个文件必须先存在，否则 docker 会建成同名目录。
+      - ./proxy.json:/app/proxy.json:ro
+    # compose reads .env for ${VAR} substitution in THIS file, which does not put
+    # anything inside the container. env_file does, and rh_env.py reads the same
+    # file for a local `uvicorn rh_server:app` - so one .env configures both, and a
+    # new setting needs no edit here.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 下面这些留空就沿用 proxy.json；有值则覆盖文件里的对应字段。
+      RH_PROXY_ENABLED: ${RH_PROXY_ENABLED:-}
+      RH_PROXY_URL: ${RH_PROXY_URL:-}
+      RH_PROXY_TOKEN: ${RH_PROXY_TOKEN:-}
+      RH_PROXY_PLATFORM: ${RH_PROXY_PLATFORM:-}
+      RH_PROXY_ACCOUNT: ${RH_PROXY_ACCOUNT:-}
+      RH_PROXY_STICKY: ${RH_PROXY_STICKY:-}
+      RH_PROXY_TRUST_HEADERS: ${RH_PROXY_TRUST_HEADERS:-}
+      RH_PROXY_VERIFY_TLS: ${RH_PROXY_VERIFY_TLS:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

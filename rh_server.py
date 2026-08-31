@@ -12,8 +12,14 @@ import anyio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from rh_models import ModelCard, REGISTRY
-from rh_router import (
+# Before every other rh_* import: .env has to be in os.environ prior to any module
+# reading a setting at import time, so dev and compose start from one config file.
+from rh_env import load as load_env
+_ENV_APPLIED = load_env()
+from rh_models import ModelCard, REGISTRY  # noqa: E402
+from rh_prompt import PromptTooLargeError  # noqa: E402
+from rh_proxy import ProxyUnavailableError, caller_tag, probe as probe_egress  # noqa: E402
+from rh_router import (  # noqa: E402
     AllCredentialsBusyError,
     CredentialPool,
     NoCredentialsError,
@@ -57,9 +63,17 @@ class ChatCompletionRequest(BaseModel):
 def _now() -> int:
     return int(time.time())
 def _error_body(message: str, code: str, status: int) -> JSONResponse:
+    # OpenAI SDKs read "type" to decide whether retrying makes sense: a 4xx is the
+    # caller's to fix, so it must not be labelled server_error.
+    if status == 429:
+        kind = "rate_limit_error"      # retryable: credentials are only cooling down
+    elif 400 <= status < 500:
+        kind = "invalid_request_error"
+    else:
+        kind = "server_error"
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": "server_error", "code": code}},
+        content={"error": {"message": message, "type": kind, "code": code}},
     )
 def _model_card(card: ModelCard) -> Dict[str, Any]:
     features: List[str] = []
@@ -77,6 +91,10 @@ def _model_card(card: ModelCard) -> Dict[str, Any]:
         out["context_window"] = card.context_window
     out["label"] = card.label
     out["features"] = features
+    # Called out on its own, not just as a feature string: when the site's own web search
+    # fires it injects thousands of tokens of fetched pages, which multiplies the cost and
+    # squeezes the emulated tool spec. A caller choosing a model for tool use wants to see it.
+    out["web_search"] = "web-search" in features
     return out
 def _flatten_content(content: Union[str, List[Dict[str, Any]], None]) -> str:
     if content is None:
@@ -131,6 +149,16 @@ def _normalize_usage(usage: Optional[Dict[str, Any]], prompt_text: str, completi
     if reasoning:
         out["reasoning_tokens"] = int(reasoning)
     return out
+def _egress_ctx(request: Request) -> Dict[str, Any]:
+    """Egress identity for this call. X-Resin-* aliases are accepted for familiarity."""
+    h = request.headers
+    platform = h.get("x-egress-platform") or h.get("x-resin-platform")
+    account = h.get("x-egress-account") or h.get("x-resin-account")
+    return {
+        "egress_platform": platform,
+        "egress_account": account,
+        "client_tag": caller_tag(h.get("authorization"), request.client.host if request.client else None),
+    }
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     router = RHRouter()
@@ -164,16 +192,54 @@ async def health(request: Request) -> Dict[str, Any]:
         "server": SERVER_NAME,
         "models": {"total": len(REGISTRY.cards)},
         "credentials": router.pool.stats(),
+        "egress": router.proxies.stats(),
+        "prompt": router.limit.stats(),
     }
 @app.post("/admin/reload")
 async def reload_state(request: Request) -> Dict[str, Any]:
     router = get_router(request)
-    cred_count = router.pool.reload()
+    # revive: an operator calling reload wants a usable pool. Depletion is otherwise
+    # permanent, so a burst of rate limits would need a container restart to clear.
+    cred_count = router.pool.reload(revive=True)
     model_count = REGISTRY.refresh()
+    proxy_ok = router.proxies.reload()
+    # A remembered 413 shrinks the budget for the whole process lifetime, and a smaller
+    # budget squeezes the tool spec - so clearing it needed a restart. Reload is the same
+    # "make the instance usable again" gesture as reviving the pool, so it belongs here.
+    prompt_reset = router.limit.reset()
     return {
         "credentials_reloaded": cred_count,
         "models_refreshed": model_count,
+        "egress_reloaded": proxy_ok,
+        "prompt_budget_reset": prompt_reset,
         "credentials": router.pool.stats(),
+        "egress": router.proxies.stats(),
+        "prompt": router.limit.stats(),
+    }
+@app.post("/admin/egress/check")
+async def egress_check(request: Request) -> Dict[str, Any]:
+    """Report the egress IP each credential actually leaves from, to verify stickiness."""
+    router = get_router(request)
+    ctx = _egress_ctx(request)
+    resolver = router.proxies
+    cred_ids = [c["id"] for c in router.pool.stats().get("credentials", [])] or [None]
+    def _run() -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for cid in cred_ids:
+            route = resolver.resolve(
+                cid,
+                platform=ctx["egress_platform"],
+                account=ctx["egress_account"],
+                client_tag=ctx["client_tag"],
+            )
+            results.append({"credential_id": cid, **probe_egress(route)})
+        return results
+    checks = await anyio.to_thread.run_sync(_run)
+    distinct = sorted({c["ip"] for c in checks if c.get("ip")})
+    return {
+        "egress": resolver.stats(),
+        "checks": checks,
+        "distinct_ips": distinct,
     }
 def _sse_chunk(cid: str, created: int, model_id: str, delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
     payload: Dict[str, Any] = {
@@ -184,13 +250,14 @@ def _sse_chunk(cid: str, created: int, model_id: str, delta: Dict[str, Any], fin
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-def _pump_events(router: RHRouter, messages: List[Dict[str, Any]], card: ModelCard, body: ChatCompletionRequest) -> Tuple[Any, object]:
+def _pump_events(router: RHRouter, messages: List[Dict[str, Any]], card: ModelCard, body: ChatCompletionRequest, egress: Optional[Dict[str, Any]] = None) -> Tuple[Any, object]:
     gen = router.stream(
         messages, model=card.id,
         tools=body.tools, tool_choice=body.tool_choice,
         temperature=body.temperature, top_p=body.top_p,
         max_tokens=body.max_tokens or body.max_completion_tokens,
         reasoning_effort=body.reasoning_effort, response_format=body.response_format,
+        **(egress or {}),
     )
     events: "_queue.Queue[Any]" = _queue.Queue()
     sentinel = object()
@@ -333,8 +400,9 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
             return _error_body(f"The model '{body.model}' does not exist", "model_not_found", 404)
         return _error_body("model registry is empty - could not fetch the live catalog from tryingopen.com", "no_models", 503)
     messages = _messages_to_dicts(body.messages)
+    egress = _egress_ctx(request)
     if body.stream:
-        events, sentinel = await anyio.to_thread.run_sync(lambda: _pump_events(router, messages, card, body))
+        events, sentinel = await anyio.to_thread.run_sync(lambda: _pump_events(router, messages, card, body, egress))
         try:
             first = await anyio.to_thread.run_sync(functools.partial(events.get, timeout=90.0))
         except _queue.Empty:
@@ -345,6 +413,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
             kind, ev = first
             if kind == "exc":
                 exc = ev
+                if isinstance(exc, PromptTooLargeError):
+                    return _error_body(str(exc), "context_length_exceeded", 400)
+                if isinstance(exc, ProxyUnavailableError):
+                    return _error_body(str(exc), "egress_proxy_unavailable", 502)
                 if isinstance(exc, NoCredentialsError):
                     return _error_body(str(exc), "no_credentials", 503)
                 if isinstance(exc, AllCredentialsBusyError):
@@ -367,8 +439,13 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 temperature=body.temperature, top_p=body.top_p,
                 max_tokens=body.max_tokens or body.max_completion_tokens,
                 reasoning_effort=body.reasoning_effort, response_format=body.response_format,
+                **egress,
             )
         )
+    except PromptTooLargeError as exc:
+        return _error_body(str(exc), "context_length_exceeded", 400)
+    except ProxyUnavailableError as exc:
+        return _error_body(str(exc), "egress_proxy_unavailable", 502)
     except NoCredentialsError as exc:
         return _error_body(str(exc), "no_credentials", 503)
     except AllCredentialsBusyError as exc:
@@ -379,12 +456,19 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         return _error_body(str(exc), "upstream_error", 502)
     prompt_text = "".join(_flatten_content(m.content) for m in body.messages)
     completion_text = result["text"]
+    tool_calls = result.get("tool_calls")
+    if not completion_text and not tool_calls:
+        # Reasoning-heavy models sometimes finish with everything in the reasoning
+        # channel and no content. The streaming path already falls back to it
+        # (_ensure_block); without the same fallback here the identical request
+        # returns usable text when streamed and content: null when not.
+        completion_text = (result.get("reasoning") or "").strip()
     usage = _normalize_usage(result.get("usage"), prompt_text, completion_text)
     message: Dict[str, Any] = {"role": "assistant", "content": completion_text or None}
     if result.get("reasoning"):
         message["reasoning_content"] = result["reasoning"]
-    if result.get("tool_calls"):
-        message["tool_calls"] = result["tool_calls"]
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return JSONResponse({
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",

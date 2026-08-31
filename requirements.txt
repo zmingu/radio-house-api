@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-requests
+requests[socks]
 pydantic
 anyio

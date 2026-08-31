@@ -3,7 +3,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 SITE_ORIGIN = "https://www.tryingopen.com"
 SITE_URL = SITE_ORIGIN + "/"
@@ -18,6 +18,11 @@ _CHUNK_RE = re.compile(r"/_next/static/chunks/[A-Za-z0-9._~\-]+\.js(?:\?[^\s\"']
 _RECORD_HEAD = re.compile(r"\{id:\"([a-z0-9][a-z0-9.\-]*/[a-z0-9][a-z0-9.\-]*)\",name:\"([^\"]+)\"")
 _CONTEXT_RE = re.compile(r"\bcontext:\"([^\"]+)\"")
 _PRICE_RE = re.compile(r"\bpricePerMTok:([0-9.]+)")
+# webSearch is absent on most records and present only to switch it OFF, so absent means on.
+# Verified against the wire: glm-5.3-flash carries no field and reports webSearch=true at
+# runtime, while qwen3.8-flash carries webSearch:!1 and reports false.
+_WEB_SEARCH_OFF_RE = re.compile(r"\bwebSearch:!1")
+_WEB_SEARCH_ON_RE = re.compile(r"\bwebSearch:!0")
 def _slugify(pid: str) -> str:
     s = pid.strip().lower()
     s = re.sub(r"[@+_/]", "-", s)
@@ -61,6 +66,7 @@ class Route:
     supported_parameters: Tuple[str, ...] = ()
     label: str = ""
     aliases: Tuple[str, ...] = ()
+    web_search: bool = True
 @dataclass(frozen=True)
 class ModelCard:
     id: str
@@ -69,6 +75,8 @@ class ModelCard:
     context_window: int = 0
     owned_by: str = "radio-house"
     aliases: Tuple[str, ...] = ()
+def _card_has(card: "ModelCard", feature: str) -> bool:
+    return any(feature in r.features for r in card.routes)
 @dataclass
 class RouteHealth:
     failures: int = 0
@@ -84,8 +92,28 @@ class RouteHealth:
         if hard or self.failures >= ROUTE_FAILURE_LIMIT:
             self.cooldown_until = time.time() + ROUTE_COOLDOWN_S
             self.failures = 0
+_PROXY_PROVIDER: Optional[Callable[[], Any]] = None
+def set_proxy_provider(provider: Optional[Callable[[], Any]]) -> None:
+    """Route catalog fetches through the egress proxy too.
+
+    Without this the catalog request would leave from the host's own address while
+    chat traffic went through the proxy, showing the site two different IPs.
+    """
+    global _PROXY_PROVIDER
+    _PROXY_PROVIDER = provider
 def _fetch_text(url: str) -> str:
-    resp = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    proxies, verify = None, True
+    if _PROXY_PROVIDER is not None:
+        try:
+            route = _PROXY_PROVIDER()
+        except Exception:
+            route = None
+        if route is not None:
+            proxies, verify = route.proxies, route.verify
+    resp = requests.get(
+        url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+        proxies=proxies, verify=verify,
+    )
     resp.raise_for_status()
     return resp.text
 def _parse_catalog(js: str) -> List[Dict[str, Any]]:
@@ -104,12 +132,21 @@ def _parse_catalog(js: str) -> List[Dict[str, Any]]:
         features = ["tool-use"] if "supportsTools:!0" in seg else []
         if "supportsImages:!0" in seg:
             features.append("images")
+        # The site runs its own web search server-side and the client cannot switch it off:
+        # the only request fields the site's own UI sends are model and effort. When it is on
+        # it injects thousands of tokens of fetched pages into the prompt, which inflates
+        # cost, crowds out the emulated tool spec and pushes the request toward the 413
+        # ceiling. Surfacing it lets a caller pick a model that does not do that.
+        web_search = not _WEB_SEARCH_OFF_RE.search(seg) or bool(_WEB_SEARCH_ON_RE.search(seg))
+        if web_search:
+            features.append("web-search")
         pm = _PRICE_RE.search(seg)
         records.append({
             "id": raw_id,
             "name": name,
             "context_window": _parse_context(cm.group(1)),
             "features": tuple(features),
+            "web_search": web_search,
             "price_per_mtok": float(pm.group(1)) if pm else None,
         })
         seen.add(raw_id)
@@ -174,6 +211,7 @@ def _build_cards(rows: List[Dict[str, Any]]) -> Tuple[List[ModelCard], Dict[str,
             features=row["features"],
             label=f"{name} @ {PROVIDER}",
             aliases=aliases,
+            web_search=bool(row.get("web_search", True)),
         )
         card = ModelCard(
             id=card_id,
@@ -244,13 +282,23 @@ class ModelRegistry:
         with self._lock:
             return list(self._cards)
     def default(self) -> Optional[ModelCard]:
+        """Card to use when the caller names no model.
+
+        Only the unspecified case is chosen here: a model the caller did ask for is never
+        swapped, however expensive its web search is. Among the fallbacks, one that supports
+        tools without the site's web search is worth more than a nominally stronger model,
+        since the injected search results cost real money and crowd out the tool spec.
+        """
         cards = self.cards
         if not cards:
             return None
-        for preferred in ("qwen3.8-27b", "deepseek-v4-flash-0731", "glm-5.3", "kimi-k3"):
+        for preferred in ("qwen3.8-flash", "qwen3.8-27b", "deepseek-v4-flash-0731", "glm-5.3", "kimi-k3"):
             card = self.resolve(preferred, strict=True)
             if card:
                 return card
+        quiet = [c for c in cards if _card_has(c, "tool-use") and not _card_has(c, "web-search")]
+        if quiet:
+            return quiet[0]
         return cards[0]
     def resolve(self, model_id: Optional[str], strict: bool = False) -> Optional[ModelCard]:
         if not model_id:

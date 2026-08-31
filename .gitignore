@@ -1,4 +1,10 @@
 __pycache__/
 tryingopen_analysis/
 credentials.json
+proxy.json
 .env
+# Secrets and local scratch that must never be committed.
+*.key
+*.pem
+server.log
+_t/

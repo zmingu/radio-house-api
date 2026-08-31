@@ -1,0 +1,29 @@
+{
+  "_about": "Egress proxy config. Copy to proxy.json and edit. Every field can also be set with RH_PROXY_* env vars, which win over this file.",
+
+  "enabled": true,
+  "_url": "Forward-proxy endpoint. http/https/socks5/socks5h. From inside a container use the host's LAN IP, not 127.0.0.1.",
+  "url": "http://10.0.0.104:2260",
+  "_token": "Shared proxy password (Resin: RESIN_PROXY_TOKEN).",
+  "token": "replace-with-your-proxy-token",
+
+  "_platform": "Node pool / isolation group on the proxy side. 'Default' holds every usable node.",
+  "platform": "Default",
+
+  "_sticky": "credential = one fixed egress IP per upstream cookie (recommended: the site sees a stable cookie-to-IP pairing). client = one IP per downstream caller. fixed = one IP for the whole instance, taken from 'account'. none = no stickiness, rotate freely inside the platform.",
+  "sticky": "credential",
+
+  "_account": "Used as the account when sticky is 'fixed', and as the fallback when a sticky tag cannot be derived.",
+  "account": "",
+
+  "_trust_headers": "Allow callers to pick their own egress with X-Egress-Platform / X-Egress-Account. Turn off to stop downstream clients choosing an egress identity.",
+  "trust_headers": true,
+
+  "verify_tls": true,
+
+  "_bindings": "Pin specific credential ids to a platform/account, overriding the sticky mode. Long form or the 'Platform.Account' shorthand.",
+  "bindings": {
+    "example-credential-id": "Default.user_tom",
+    "another-credential-id": { "platform": "JP", "account": "user_amy" }
+  }
+}

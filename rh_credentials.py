@@ -16,6 +16,10 @@ class Credential:
     user_agent: str = DEFAULT_USER_AGENT
     created_at: str = field(default_factory=_utc_now)
     source: str = "anonymous"
+    # True only for entries read from the file. The pool's fallback credential is built in
+    # code when the file is empty, and writing it back would turn a hand-written pool into
+    # the synthetic one. Not serialised: load() sets it, save() re-derives it.
+    from_file: bool = False
     def is_valid(self) -> bool:
         return True
     def cookie_dict(self) -> dict:
@@ -44,6 +48,7 @@ class CredentialFile:
                 user_agent=item.get("user_agent", DEFAULT_USER_AGENT),
                 created_at=item.get("created_at", _utc_now()),
                 source=item.get("source", "anonymous"),
+                from_file=True,
             ))
         return creds
     def save(self, credentials: List[Credential]) -> None:
@@ -51,7 +56,10 @@ class CredentialFile:
             "version": 1,
             "updated_at": _utc_now(),
             "count": len(credentials),
-            "credentials": [asdict(c) for c in credentials],
+            # from_file is runtime state, not configuration: load() sets it for everything
+            # it reads, so writing it would be redundant and confusing to edit by hand.
+            "credentials": [{k: v for k, v in asdict(c).items() if k != "from_file"}
+                            for c in credentials],
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 def ensure_fresh(credential: Credential) -> Credential:

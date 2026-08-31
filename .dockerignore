@@ -1,0 +1,14 @@
+.git/
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+tryingopen_analysis/
+README.md
+Dockerfile
+.dockerignore
+compose.yaml
+# 凭据/代理令牌不进镜像层，运行时用 bind 挂载注入
+credentials.json
+proxy.json
+.env
