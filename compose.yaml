@@ -2,26 +2,28 @@ name: ${COMPOSE_PROJECT_NAME:-radio-house-api}
 
 services:
   radio-house-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: radio-house-api:local
+    image: ghcr.io/zmingu/radio-house-api:latest
     container_name: radio-house-api
     restart: unless-stopped
     ports:
-      # 该 API 自身没有鉴权。想只给本机用就改成 "127.0.0.1:${HOST_PORT:-8002}:8002"。
-      - "${HOST_PORT:-8002}:8002"
+      # 该 API 自身没有鉴权，所以绑 127.0.0.1。要给 LAN 用就在前面挂带认证的反代。
+      # 同宿主机的消费者可通过 shared-ai 网络用容器名直连，不需要暴露公网端口。
+      - "127.0.0.1:${HOST_PORT:-8002}:8002"
+    networks:
+      # default 要显式列出：一旦声明了 networks，Compose 就不再自动接入默认网络。
+      - default
+      # 跨 Compose 项目的内部总线。使用前先执行：docker network create shared-ai
+      - shared-ai
     volumes:
       # 容器内 /app/credentials.json 就是 CredentialPool 的默认路径。
       # 必须可写：凭据耗尽时 _save() 会回写这个文件，挂 :ro 会报错。
       - ./credentials.json:/app/credentials.json
       # 出口代理配置。只读即可，进程不写它。
-      # 注意：宿主机上这个文件必须先存在，否则 docker 会建成同名目录。
+      # 注意：宿主机上这个文件必须先存在，否则 Docker 会建成同名目录。
       - ./proxy.json:/app/proxy.json:ro
     # compose reads .env for ${VAR} substitution in THIS file, which does not put
     # anything inside the container. env_file does, and rh_env.py reads the same
-    # file for a local `uvicorn rh_server:app` - so one .env configures both, and a
-    # new setting needs no edit here.
+    # file for a local `uvicorn rh_server:app` - so one .env configures both.
     env_file:
       - path: .env
         required: false
@@ -41,3 +43,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  # 由 `docker network create shared-ai` 在 Compose 之外建立，两个项目共用。
+  # external 表示 Compose 不创建也不删除它，只接入。
+  shared-ai:
+    external: true
